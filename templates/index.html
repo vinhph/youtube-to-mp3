@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube to MP3 Player</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            display: flex;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 2rem 1rem;
+        }
+        .container {
+            width: 100%;
+            max-width: 720px;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+        .card {
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 14px;
+            padding: 1.75rem;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
+        }
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 0.35rem;
+            color: #ffffff;
+        }
+        p.subtitle {
+            font-size: 0.9rem;
+            color: #94a3b8;
+            margin-bottom: 1.25rem;
+        }
+        .input-group {
+            display: flex;
+            gap: 0.6rem;
+        }
+        input[type="text"] {
+            flex: 1;
+            padding: 0.8rem 1rem;
+            border-radius: 8px;
+            border: 1px solid #475569;
+            background-color: #0f172a;
+            color: #f8fafc;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input[type="text"]:focus {
+            border-color: #ef4444;
+        }
+        button.primary-btn {
+            padding: 0.8rem 1.4rem;
+            border-radius: 8px;
+            border: none;
+            background-color: #ef4444;
+            color: #ffffff;
+            font-weight: 600;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            white-space: nowrap;
+        }
+        button.primary-btn:hover {
+            background-color: #dc2626;
+        }
+        button.primary-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        #status-msg {
+            margin-top: 1rem;
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            font-size: 0.9rem;
+            display: none;
+            word-break: break-word;
+        }
+        /* Player Card */
+        .player-card {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        .now-playing-header {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        .now-playing-thumb {
+            width: 64px;
+            height: 64px;
+            border-radius: 8px;
+            object-fit: cover;
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            flex-shrink: 0;
+        }
+        .now-playing-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .now-playing-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #ef4444;
+            font-weight: 700;
+            margin-bottom: 0.2rem;
+        }
+        .now-playing-title {
+            font-size: 1.05rem;
+            font-weight: 600;
+            color: #f8fafc;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .now-playing-uploader {
+            font-size: 0.85rem;
+            color: #94a3b8;
+        }
+        audio {
+            width: 100%;
+            height: 42px;
+            border-radius: 8px;
+        }
+        /* Playlist */
+        .playlist-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        .playlist-header h2 {
+            font-size: 1.15rem;
+            color: #f8fafc;
+        }
+        .playlist-count {
+            font-size: 0.85rem;
+            color: #94a3b8;
+        }
+        .playlist-list {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+        }
+        .playlist-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+            padding: 0.75rem 1rem;
+            border-radius: 10px;
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            transition: border-color 0.15s, background-color 0.15s;
+        }
+        .playlist-item:hover {
+            border-color: #475569;
+        }
+        .playlist-item.active {
+            border-color: #ef4444;
+            background-color: #1e1b2e;
+        }
+        .track-main {
+            display: flex;
+            align-items: center;
+            gap: 0.85rem;
+            flex: 1;
+            min-width: 0;
+            cursor: pointer;
+        }
+        .track-thumb {
+            width: 48px;
+            height: 48px;
+            border-radius: 6px;
+            object-fit: cover;
+            background-color: #1e293b;
+            flex-shrink: 0;
+        }
+        .track-meta {
+            flex: 1;
+            min-width: 0;
+        }
+        .track-title {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #f8fafc;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .track-sub {
+            font-size: 0.8rem;
+            color: #94a3b8;
+            margin-top: 0.15rem;
+        }
+        .track-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            flex-shrink: 0;
+        }
+        .icon-btn {
+            padding: 0.45rem 0.75rem;
+            border-radius: 6px;
+            border: 1px solid #334155;
+            background-color: #1e293b;
+            color: #e2e8f0;
+            font-size: 0.8rem;
+            font-weight: 500;
+            text-decoration: none;
+            cursor: pointer;
+            transition: background-color 0.15s, border-color 0.15s;
+        }
+        .icon-btn:hover {
+            background-color: #334155;
+            border-color: #475569;
+        }
+        .icon-btn.play-btn {
+            background-color: #ef4444;
+            border-color: #ef4444;
+            color: #fff;
+        }
+        .icon-btn.play-btn:hover {
+            background-color: #dc2626;
+        }
+        .icon-btn.delete-btn:hover {
+            background-color: #7f1d1d;
+            border-color: #ef4444;
+            color: #fecaca;
+        }
+        .empty-state {
+            text-align: center;
+            color: #64748b;
+            padding: 2rem 1rem;
+            font-size: 0.95rem;
+        }
+        @media (max-width: 520px) {
+            .input-group {
+                flex-direction: column;
+            }
+            .track-actions {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Convert Form Card -->
+        <div class="card">
+            <h1>YouTube to MP3</h1>
+            <p class="subtitle">Paste a YouTube link or Video ID to convert to MP3 and play</p>
+
+            <form id="convert-form" class="input-group">
+                <input
+                    type="text"
+                    id="youtube-url"
+                    placeholder="https://www.youtube.com/watch?v=8Bu8emNLhmE or 8Bu8emNLhmE"
+                    required
+                />
+                <button type="submit" id="submit-btn" class="primary-btn">Convert to MP3</button>
+            </form>
+
+            <div id="status-msg"></div>
+        </div>
+
+        <!-- Audio Player Card -->
+        <div class="card player-card">
+            <div class="now-playing-header">
+                <img
+                    id="np-thumb"
+                    class="now-playing-thumb"
+                    src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><rect width='100%' height='100%' fill='%230f172a'/><text x='50%' y='54%' font-size='24' text-anchor='middle' fill='%23ef4444'>♪</text></svg>"
+                    alt="Thumbnail"
+                />
+                <div class="now-playing-info">
+                    <div class="now-playing-label">Now Playing</div>
+                    <div id="np-title" class="now-playing-title">Select a track from the playlist</div>
+                    <div id="np-uploader" class="now-playing-uploader">—</div>
+                </div>
+            </div>
+            <audio id="audio-player" controls preload="metadata" referrerpolicy="no-referrer"></audio>
+        </div>
+
+        <!-- Playlist Card -->
+        <div class="card">
+            <div class="playlist-header">
+                <h2>MP3 Playlist</h2>
+                <span id="playlist-count" class="playlist-count">0 tracks</span>
+            </div>
+            <ul id="playlist" class="playlist-list"></ul>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('convert-form');
+        const input = document.getElementById('youtube-url');
+        const statusMsg = document.getElementById('status-msg');
+        const submitBtn = document.getElementById('submit-btn');
+
+        const audioPlayer = document.getElementById('audio-player');
+        const npTitle = document.getElementById('np-title');
+        const npUploader = document.getElementById('np-uploader');
+        const npThumb = document.getElementById('np-thumb');
+
+        const playlistEl = document.getElementById('playlist');
+        const playlistCount = document.getElementById('playlist-count');
+
+        const DEFAULT_THUMB = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><rect width='100%' height='100%' fill='%230f172a'/><text x='50%' y='54%' font-size='24' text-anchor='middle' fill='%23ef4444'>♪</text></svg>";
+
+        let tracks = [];
+        let currentIndex = -1;
+        let lastKnownTime = 0;
+        let lastServerSync = 0;
+
+        function getSavedPosition(track) {
+            if (!track) return 0;
+            const localVal = parseFloat(localStorage.getItem(`pos_${track.id}`) || '0');
+            const serverVal = parseFloat(track.last_position || 0);
+            return Math.max(localVal || 0, serverVal || 0);
+        }
+
+        function savePosition(track, seconds, forceServer = false) {
+            if (!track || isNaN(seconds) || seconds < 0) return;
+            track.last_position = seconds;
+            localStorage.setItem(`pos_${track.id}`, String(Math.floor(seconds)));
+            localStorage.setItem('last_active_track_id', track.id);
+
+            const now = Date.now();
+            if (forceServer || now - lastServerSync > 10000) {
+                lastServerSync = now;
+                fetch(`/api/progress/${track.id}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ position: Math.floor(seconds) })
+                }).catch(() => {});
+            }
+        }
+
+        function setAudioSourceAndSeek(url, seekSeconds, autoPlay = true) {
+            audioPlayer.src = url;
+            const targetTime = seekSeconds && seekSeconds > 2 ? seekSeconds : 0;
+
+            if (targetTime > 0) {
+                const onLoaded = () => {
+                    audioPlayer.removeEventListener('loadedmetadata', onLoaded);
+                    try {
+                        if (!audioPlayer.duration || targetTime < audioPlayer.duration - 2) {
+                            audioPlayer.currentTime = targetTime;
+                        }
+                    } catch (e) {
+                        console.error('Seek error:', e);
+                    }
+                    if (autoPlay) {
+                        audioPlayer.play().catch(() => {});
+                    }
+                };
+                audioPlayer.addEventListener('loadedmetadata', onLoaded);
+            } else if (autoPlay) {
+                audioPlayer.play().catch(() => {});
+            }
+        }
+
+        function formatDuration(seconds) {
+            if (!seconds || isNaN(seconds)) return '';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+            if (h > 0) {
+                return `${h}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+            }
+            return `${m}:${s < 10 ? '0' : ''}${s}`;
+        }
+
+        function showStatus(text, isError = false) {
+            statusMsg.textContent = text;
+            statusMsg.style.color = isError ? '#f87171' : '#38bdf8';
+            statusMsg.style.display = 'block';
+        }
+
+        function renderPlaylist() {
+            playlistCount.textContent = `${tracks.length} track${tracks.length === 1 ? '' : 's'}`;
+            playlistEl.innerHTML = '';
+
+            if (tracks.length === 0) {
+                const empty = document.createElement('li');
+                empty.className = 'empty-state';
+                empty.textContent = 'No MP3 files yet. Paste a YouTube URL above to convert your first track!';
+                playlistEl.appendChild(empty);
+                return;
+            }
+
+            tracks.forEach((track, idx) => {
+                const li = document.createElement('li');
+                li.className = 'playlist-item' + (idx === currentIndex ? ' active' : '');
+
+                const main = document.createElement('div');
+                main.className = 'track-main';
+                main.onclick = () => playTrack(idx);
+
+                const thumb = document.createElement('img');
+                thumb.className = 'track-thumb';
+                thumb.src = track.thumbnail || DEFAULT_THUMB;
+                thumb.onerror = () => { thumb.src = DEFAULT_THUMB; };
+
+                const meta = document.createElement('div');
+                meta.className = 'track-meta';
+
+                const title = document.createElement('div');
+                title.className = 'track-title';
+                title.textContent = track.title;
+
+                const sub = document.createElement('div');
+                sub.className = 'track-sub';
+                const dur = formatDuration(track.duration);
+                const savedPos = getSavedPosition(track);
+                const posText = savedPos > 5 ? `Resume ${formatDuration(savedPos)}` : '';
+                sub.textContent = [track.uploader, dur, posText].filter(Boolean).join(' • ') || 'MP3 Audio';
+
+                meta.appendChild(title);
+                meta.appendChild(sub);
+                main.appendChild(thumb);
+                main.appendChild(meta);
+
+                const actions = document.createElement('div');
+                actions.className = 'track-actions';
+
+                const playBtn = document.createElement('button');
+                playBtn.className = 'icon-btn play-btn';
+                playBtn.textContent = (idx === currentIndex && !audioPlayer.paused) ? 'Pause' : 'Play';
+                playBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (idx === currentIndex) {
+                        if (audioPlayer.paused) audioPlayer.play();
+                        else audioPlayer.pause();
+                    } else {
+                        playTrack(idx);
+                    }
+                };
+
+                const dlLink = document.createElement('a');
+                dlLink.className = 'icon-btn';
+                dlLink.href = `/api/download/${track.id}`;
+                dlLink.textContent = 'Download';
+
+                const restartBtn = document.createElement('button');
+                restartBtn.className = 'icon-btn';
+                restartBtn.textContent = 'Restart';
+                restartBtn.title = 'Play from 0:00';
+                restartBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    savePosition(track, 0, true);
+                    playTrack(idx, 0);
+                };
+
+                const delBtn = document.createElement('button');
+                delBtn.className = 'icon-btn delete-btn';
+                delBtn.textContent = 'Delete';
+                delBtn.onclick = async (e) => {
+                    e.stopPropagation();
+                    await deleteTrack(track.id, idx);
+                };
+
+                actions.appendChild(playBtn);
+                actions.appendChild(restartBtn);
+                actions.appendChild(dlLink);
+                actions.appendChild(delBtn);
+
+                li.appendChild(main);
+                li.appendChild(actions);
+                playlistEl.appendChild(li);
+            });
+        }
+
+        function playTrack(index, overrideSeek = null, autoPlay = true) {
+            if (index < 0 || index >= tracks.length) return;
+            currentIndex = index;
+            const track = tracks[index];
+
+            const resumePos = overrideSeek !== null ? overrideSeek : getSavedPosition(track);
+            lastKnownTime = resumePos;
+
+            audioPlayer.dataset.retried = 'false';
+            npTitle.textContent = track.title;
+            npUploader.textContent = track.uploader || 'YouTube Audio';
+            npThumb.src = track.thumbnail || DEFAULT_THUMB;
+            npThumb.onerror = () => { npThumb.src = DEFAULT_THUMB; };
+
+            setAudioSourceAndSeek(track.audio_url, resumePos, autoPlay);
+            renderPlaylist();
+        }
+
+        // Continuously save listening position so pausing for hours or refreshing never loses your spot
+        audioPlayer.addEventListener('timeupdate', () => {
+            if (currentIndex < 0 || currentIndex >= tracks.length) return;
+            if (audioPlayer.currentTime > 1) {
+                lastKnownTime = audioPlayer.currentTime;
+                savePosition(tracks[currentIndex], audioPlayer.currentTime, false);
+            }
+        });
+
+        // If a saved RapidAPI CDN link expired after pausing for hours, refresh it and restore exact timestamp
+        audioPlayer.addEventListener('error', async () => {
+            if (currentIndex < 0 || currentIndex >= tracks.length) return;
+            if (audioPlayer.dataset.retried === 'true') return;
+            audioPlayer.dataset.retried = 'true';
+
+            const track = tracks[currentIndex];
+            const resumeTime = Math.max(audioPlayer.currentTime || 0, lastKnownTime || 0, getSavedPosition(track));
+            showStatus(`Refreshing expired audio stream and resuming at ${formatDuration(resumeTime)}...`);
+
+            try {
+                const res = await fetch(`/api/refresh/${track.id}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    tracks[currentIndex] = { ...track, ...data.track, last_position: resumeTime };
+                    setAudioSourceAndSeek(data.track.audio_url, resumeTime, true);
+                    showStatus(`Resumed "${track.title}" at ${formatDuration(resumeTime)}`);
+                }
+            } catch (e) {
+                console.error('Failed to refresh audio link:', e);
+            }
+        });
+
+        audioPlayer.addEventListener('ended', () => {
+            if (currentIndex >= 0 && currentIndex < tracks.length) {
+                // Reset position to 0 when a track finishes completely
+                savePosition(tracks[currentIndex], 0, true);
+            }
+            if (currentIndex >= 0 && currentIndex + 1 < tracks.length) {
+                playTrack(currentIndex + 1);
+            } else {
+                renderPlaylist();
+            }
+        });
+
+        audioPlayer.addEventListener('play', renderPlaylist);
+        audioPlayer.addEventListener('pause', () => {
+            if (currentIndex >= 0 && currentIndex < tracks.length && audioPlayer.currentTime > 1) {
+                savePosition(tracks[currentIndex], audioPlayer.currentTime, true);
+            }
+            renderPlaylist();
+        });
+
+        async function fetchPlaylist() {
+            try {
+                const res = await fetch('/api/playlist');
+                const data = await res.json();
+                tracks = data.tracks || [];
+                renderPlaylist();
+
+                // Restore the last active track into the player (paused at saved position) on page load
+                const lastActiveId = localStorage.getItem('last_active_track_id');
+                if (currentIndex === -1 && tracks.length > 0) {
+                    const idx = lastActiveId ? tracks.findIndex(t => t.id === lastActiveId) : 0;
+                    if (idx >= 0 && getSavedPosition(tracks[idx]) > 0) {
+                        playTrack(idx, null, false);
+                    }
+                }
+            } catch (err) {
+                console.error('Failed to load playlist:', err);
+            }
+        }
+
+        async function deleteTrack(trackId, idx) {
+            try {
+                const res = await fetch(`/api/playlist/${trackId}`, { method: 'DELETE' });
+                if (!res.ok) throw new Error('Failed to delete track');
+                const data = await res.json();
+                tracks = data.tracks || [];
+
+                if (idx === currentIndex) {
+                    audioPlayer.pause();
+                    audioPlayer.removeAttribute('src');
+                    audioPlayer.load();
+                    currentIndex = -1;
+                    npTitle.textContent = 'Select a track from the playlist';
+                    npUploader.textContent = '—';
+                    npThumb.src = DEFAULT_THUMB;
+                } else if (idx < currentIndex) {
+                    currentIndex--;
+                }
+                renderPlaylist();
+            } catch (err) {
+                showStatus('Error deleting track: ' + err.message, true);
+            }
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const url = input.value.trim();
+            if (!url) return;
+
+            const currentTrackId = currentIndex >= 0 && tracks[currentIndex] ? tracks[currentIndex].id : null;
+
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Converting...';
+            showStatus('Converting via RapidAPI & saving MP3... Please wait a few seconds.');
+
+            try {
+                const response = await fetch('/api/convert', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.detail || 'Conversion failed');
+                }
+
+                tracks = data.tracks || [];
+                input.value = '';
+                showStatus(`Ready: "${data.track.title}"`);
+
+                if (currentTrackId && !audioPlayer.paused) {
+                    currentIndex = tracks.findIndex(t => t.id === currentTrackId);
+                    renderPlaylist();
+                } else {
+                    const idx = tracks.findIndex(t => t.id === data.track.id);
+                    playTrack(idx >= 0 ? idx : 0);
+                }
+            } catch (err) {
+                showStatus(err.message, true);
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Convert to MP3';
+            }
+        });
+
+        fetchPlaylist();
+    </script>
+</body>
+</html>
