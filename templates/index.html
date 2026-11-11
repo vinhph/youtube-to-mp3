@@ -438,6 +438,8 @@
                     r2Text = '☁️ R2 Ready';
                 } else if (track.r2_status === 'uploading') {
                     r2Text = `☁️ Saving to R2 (${track.r2_progress || 0}%)`;
+                } else if (track.r2_status === 'failed') {
+                    r2Text = `⚠️ R2 Retry Needed (${track.r2_progress || 0}%)`;
                 }
                 sub.textContent = [track.uploader, dur, posText, r2Text].filter(Boolean).join(' • ') || 'MP3 Audio';
 

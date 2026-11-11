@@ -373,26 +373,39 @@ async def background_upload_to_r2(
                     end_byte = min(offset + PART_SIZE - 1, total_size - 1)
                     expected_chunk_len = end_byte - offset + 1
 
-                    # Fetch this 8 MB range with strict 30s timeout and up to 5 retries
+                    # Fetch this 8 MB range using native curl subprocess via WARP SOCKS5 proxy
+                    # (Avoids Python httpx socksio connection pool deadlocks after 35+ requests)
                     part_bytes = b""
                     for attempt in range(5):
                         try:
-                            range_headers = {**base_headers, "Range": f"bytes={offset}-{end_byte}"}
                             target_url = resolved_url if attempt == 0 else source_stream_url
-                            chunk_resp = await asyncio.wait_for(
-                                stream_client.get(target_url, headers=range_headers),
-                                timeout=30.0,
+                            proc = await asyncio.create_subprocess_exec(
+                                "curl",
+                                "-s",
+                                "-L",
+                                "--proxy",
+                                WARP_PROXY.replace("socks5://", "socks5h://"),
+                                "--max-time",
+                                "45",
+                                "-r",
+                                f"{offset}-{end_byte}",
+                                "-A",
+                                base_headers["User-Agent"],
+                                target_url,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
                             )
-                            if target_url == source_stream_url and chunk_resp.status_code in (200, 206):
-                                resolved_url = str(chunk_resp.url)
-                            if chunk_resp.status_code in (200, 206) and len(chunk_resp.content) == expected_chunk_len:
-                                part_bytes = chunk_resp.content
+                            stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=50.0)
+                            if proc.returncode == 0 and len(stdout_data) == expected_chunk_len:
+                                part_bytes = stdout_data
                                 break
+                            print(
+                                f"[R2] curl range {offset}-{end_byte} attempt {attempt + 1}: "
+                                f"rc={proc.returncode}, got={len(stdout_data)}/{expected_chunk_len}"
+                            )
                         except Exception as chunk_err:
-                            print(f"[R2] Range {offset}-{end_byte} attempt {attempt + 1} stalled/failed: {chunk_err}")
-                            if attempt == 4:
-                                raise RuntimeError(f"Range {offset}-{end_byte} failed: {chunk_err}")
-                        await asyncio.sleep(1.5 * (attempt + 1))
+                            print(f"[R2] Range {offset}-{end_byte} attempt {attempt + 1} error: {repr(chunk_err)}")
+                        await asyncio.sleep(2.0 * (attempt + 1))
 
                     if not part_bytes:
                         raise RuntimeError(f"Failed to fetch byte range {offset}-{end_byte}")
