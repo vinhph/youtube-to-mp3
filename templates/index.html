@@ -433,7 +433,13 @@
                 const dur = formatDuration(track.duration);
                 const savedPos = getSavedPosition(track);
                 const posText = savedPos > 5 ? `Resume ${formatDuration(savedPos)}` : '';
-                sub.textContent = [track.uploader, dur, posText].filter(Boolean).join(' • ') || 'MP3 Audio';
+                let r2Text = '';
+                if (track.r2_status === 'ready') {
+                    r2Text = '☁️ R2 Ready';
+                } else if (track.r2_status === 'uploading') {
+                    r2Text = `☁️ Saving to R2 (${track.r2_progress || 0}%)`;
+                }
+                sub.textContent = [track.uploader, dur, posText, r2Text].filter(Boolean).join(' • ') || 'MP3 Audio';
 
                 meta.appendChild(title);
                 meta.appendChild(sub);
@@ -647,6 +653,29 @@
         });
 
         fetchPlaylist();
+
+        // Poll playlist status every 5 seconds while any track is backing up to Cloudflare R2
+        setInterval(async () => {
+            if (!tracks.some(t => t.r2_status === 'uploading')) return;
+            try {
+                const res = await fetch('/api/playlist');
+                if (!res.ok) return;
+                const data = await res.json();
+                const updated = data.tracks || [];
+                updated.forEach(ut => {
+                    const localTrack = tracks.find(t => t.id === ut.id);
+                    if (localTrack) {
+                        localTrack.r2_status = ut.r2_status;
+                        localTrack.r2_progress = ut.r2_progress;
+                        localTrack.r2_url = ut.r2_url;
+                        if (ut.r2_status === 'ready' && ut.r2_url) {
+                            localTrack.audio_url = ut.r2_url;
+                        }
+                    }
+                });
+                renderPlaylist();
+            } catch (e) {}
+        }, 5000);
     </script>
 </body>
 </html>
