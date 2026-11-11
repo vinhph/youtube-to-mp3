@@ -68,9 +68,10 @@ def _hmac_sha256(key: bytes, msg: str) -> bytes:
 def sign_r2_request(
     method: str,
     key_name: str,
-    query_params: Optional[ dict ] = None,
+    query_params: Optional[dict] = None,
     body: bytes = b"",
     content_type: str = "",
+    payload_hash_override: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Generate AWS SigV4 signed URL and headers for Cloudflare R2 without external SDKs."""
     query_params = query_params or {}
@@ -85,7 +86,7 @@ def sign_r2_request(
         for k, v in sorted_q
     )
 
-    payload_hash = hashlib.sha256(body).hexdigest()
+    payload_hash = payload_hash_override or hashlib.sha256(body).hexdigest()
     headers_to_sign = {
         "host": R2_HOST,
         "x-amz-content-sha256": payload_hash,
@@ -268,30 +269,61 @@ async def query_ytstream_audio(video_id: str) -> dict:
         raise RuntimeError("Timed out waiting for audio stream extraction.")
 
 
-async def _upload_part_to_r2(
-    client: httpx.AsyncClient,
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+async def _upload_part_file_to_r2(
     r2_key: str,
     upload_id: str,
     part_number: int,
-    part_bytes: bytes,
+    part_file: Path,
 ) -> str:
+    """Uploads a part file from disk to R2 using curl so 0 MB of audio bytes are held in Python RAM."""
+    payload_hash = await asyncio.to_thread(_sha256_file, part_file)
     for attempt in range(4):
         try:
-            url, hdrs = await asyncio.to_thread(
-                sign_r2_request,
+            url, hdrs = sign_r2_request(
                 "PUT",
                 r2_key,
                 {"partNumber": str(part_number), "uploadId": upload_id},
-                part_bytes,
+                payload_hash_override=payload_hash,
             )
-            resp = await asyncio.wait_for(
-                client.put(url, content=part_bytes, headers=hdrs),
-                timeout=45.0,
+            cmd = [
+                "curl",
+                "-s",
+                "-i",
+                "--max-time",
+                "60",
+                "-X",
+                "PUT",
+                "-H",
+                f"x-amz-date: {hdrs['x-amz-date']}",
+                "-H",
+                f"x-amz-content-sha256: {hdrs['x-amz-content-sha256']}",
+                "-H",
+                f"Authorization: {hdrs['Authorization']}",
+                "--upload-file",
+                str(part_file),
+                url,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if resp.status_code == 200:
-                etag = resp.headers.get("ETag") or resp.headers.get("etag")
-                if etag:
-                    return etag
+            stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=65.0)
+            resp_headers = stdout_data.decode("utf-8", errors="replace")
+            if "200 OK" in resp_headers or "HTTP/2 200" in resp_headers or "HTTP/1.1 200" in resp_headers:
+                for line in resp_headers.splitlines():
+                    if line.lower().startswith("etag:"):
+                        etag = line.split(":", 1)[1].strip()
+                        if etag:
+                            return etag
         except Exception as exc:
             print(f"[R2] Part {part_number} upload attempt {attempt + 1} error: {exc}")
         await asyncio.sleep(1.5 * (attempt + 1))
@@ -307,16 +339,17 @@ async def background_upload_to_r2(
     expected_size: int = 0,
 ) -> None:
     """
-    Streams audio from YouTube CDN in 8 MB RAM chunks directly into Cloudflare R2
-    using S3 Multipart Upload (0 MB disk storage used on server!).
+    Streams audio from YouTube CDN in 5 MB chunks via a temporary 5 MB file in /tmp
+    using native curl processes -> < 1 MB Python RAM used (prevents OOM kills on low-RAM VPS!).
     """
-    PART_SIZE = 8 * 1024 * 1024  # 8 MB in-memory buffer (S3 minimum part size is 5 MB)
+    PART_SIZE = 5 * 1024 * 1024  # 5 MB (exact S3 minimum part size, minimal temp footprint)
     upload_id: Optional[str] = None
+    tmp_part_file = Path(f"/tmp/r2_part_{track_id}.tmp")
 
     try:
         update_track_fields(track_id, r2_status="uploading", r2_progress=0)
 
-        timeout_cfg = httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=30.0)
+        timeout_cfg = httpx.Timeout(connect=30.0, read=60.0, write=60.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout_cfg, follow_redirects=True) as client:
             # 1. Initiate Multipart Upload on Cloudflare R2
             init_url, init_hdrs = sign_r2_request("POST", r2_key, {"uploads": ""}, b"", mime_type)
@@ -331,95 +364,84 @@ async def background_upload_to_r2(
                 raise RuntimeError("Missing UploadId from R2 response")
             upload_id = upload_id_el.text
 
-            # 2. Fetch from source URL in 8 MB HTTP Range requests & upload each part to R2
-            # Using Range: bytes=start-end prevents YouTube from throttling or dropping long connections!
             parts_etags: List[tuple[int, str]] = []
             part_number = 1
 
-            base_headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/128.0.0.0 Safari/537.36"
+            user_agent = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Safari/537.36"
+            )
+            socks_proxy = WARP_PROXY.replace("socks5://", "socks5h://")
+
+            # Probe total size using curl
+            total_size = expected_size
+            if not total_size:
+                probe_proc = await asyncio.create_subprocess_exec(
+                    "curl", "-s", "-L", "-I", "--proxy", socks_proxy, "--max-time", "20",
+                    "-r", "0-0", "-A", user_agent, source_stream_url,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
-            }
-
-            async with httpx.AsyncClient(
-                proxy=WARP_PROXY,
-                timeout=timeout_cfg,
-                follow_redirects=True,
-            ) as stream_client:
-                # Resolve redirect URL and total size once using a tiny 1-byte range request
-                probe_headers = {**base_headers, "Range": "bytes=0-0"}
-                probe_resp = await stream_client.get(source_stream_url, headers=probe_headers)
-                if probe_resp.status_code not in (200, 206):
-                    raise RuntimeError(f"Source stream probe returned HTTP {probe_resp.status_code}")
-
-                resolved_url = str(probe_resp.url)
-                total_size = expected_size
-                content_range = probe_resp.headers.get("content-range") or ""
-                if "/" in content_range:
-                    try:
-                        total_size = int(content_range.split("/")[-1].strip())
-                    except ValueError:
-                        pass
-                if not total_size:
-                    total_size = int(probe_resp.headers.get("content-length") or 0)
-                if not total_size:
-                    raise RuntimeError("Could not determine total audio stream byte length")
-
-                offset = 0
-                while offset < total_size:
-                    end_byte = min(offset + PART_SIZE - 1, total_size - 1)
-                    expected_chunk_len = end_byte - offset + 1
-
-                    # Fetch this 8 MB range using native curl subprocess via WARP SOCKS5 proxy
-                    # (Avoids Python httpx socksio connection pool deadlocks after 35+ requests)
-                    part_bytes = b""
-                    for attempt in range(5):
+                p_out, _ = await probe_proc.communicate()
+                for line in p_out.decode("utf-8", errors="replace").splitlines():
+                    if line.lower().startswith("content-range:") and "/" in line:
                         try:
-                            target_url = resolved_url if attempt == 0 else source_stream_url
-                            proc = await asyncio.create_subprocess_exec(
-                                "curl",
-                                "-s",
-                                "-L",
-                                "--proxy",
-                                WARP_PROXY.replace("socks5://", "socks5h://"),
-                                "--max-time",
-                                "45",
-                                "-r",
-                                f"{offset}-{end_byte}",
-                                "-A",
-                                base_headers["User-Agent"],
-                                target_url,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                            )
-                            stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=50.0)
-                            if proc.returncode == 0 and len(stdout_data) == expected_chunk_len:
-                                part_bytes = stdout_data
-                                break
-                            print(
-                                f"[R2] curl range {offset}-{end_byte} attempt {attempt + 1}: "
-                                f"rc={proc.returncode}, got={len(stdout_data)}/{expected_chunk_len}"
-                            )
-                        except Exception as chunk_err:
-                            print(f"[R2] Range {offset}-{end_byte} attempt {attempt + 1} error: {repr(chunk_err)}")
-                        await asyncio.sleep(2.0 * (attempt + 1))
+                            total_size = int(line.split("/")[-1].strip())
+                        except ValueError:
+                            pass
+            if not total_size:
+                raise RuntimeError("Could not determine total audio stream byte length")
 
-                    if not part_bytes:
-                        raise RuntimeError(f"Failed to fetch byte range {offset}-{end_byte}")
+            offset = 0
+            while offset < total_size:
+                end_byte = min(offset + PART_SIZE - 1, total_size - 1)
+                expected_chunk_len = end_byte - offset + 1
 
-                    etag = await _upload_part_to_r2(client, r2_key, upload_id, part_number, part_bytes)
-                    parts_etags.append((part_number, etag))
-                    offset += len(part_bytes)
-                    part_number += 1
+                # Download 5 MB range directly to /tmp/r2_part_<id>.tmp (0 MB in Python RAM!)
+                downloaded_ok = False
+                for attempt in range(5):
+                    try:
+                        if tmp_part_file.exists():
+                            tmp_part_file.unlink()
+                        proc = await asyncio.create_subprocess_exec(
+                            "curl",
+                            "-s",
+                            "-L",
+                            "--proxy",
+                            socks_proxy,
+                            "--max-time",
+                            "45",
+                            "-r",
+                            f"{offset}-{end_byte}",
+                            "-A",
+                            user_agent,
+                            "-o",
+                            str(tmp_part_file),
+                            source_stream_url,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        await asyncio.wait_for(proc.communicate(), timeout=50.0)
+                        if proc.returncode == 0 and tmp_part_file.exists() and tmp_part_file.stat().st_size == expected_chunk_len:
+                            downloaded_ok = True
+                            break
+                    except Exception as chunk_err:
+                        print(f"[R2] Range {offset}-{end_byte} attempt {attempt + 1} error: {repr(chunk_err)}")
+                    await asyncio.sleep(2.0 * (attempt + 1))
 
-                    pct = min(99, round((offset / total_size) * 100))
-                    update_track_fields(track_id, r2_status="uploading", r2_progress=pct)
-                    await asyncio.sleep(0.05)
+                if not downloaded_ok:
+                    raise RuntimeError(f"Failed to fetch byte range {offset}-{end_byte}")
 
-                total_uploaded = offset
+                etag = await _upload_part_file_to_r2(r2_key, upload_id, part_number, tmp_part_file)
+                parts_etags.append((part_number, etag))
+                offset += expected_chunk_len
+                part_number += 1
+
+                pct = min(99, round((offset / total_size) * 100))
+                update_track_fields(track_id, r2_status="uploading", r2_progress=pct)
+                await asyncio.sleep(0.05)
+
+            total_uploaded = offset
 
             # 3. Complete Multipart Upload
             parts_xml = "".join(
@@ -460,6 +482,11 @@ async def background_upload_to_r2(
             except Exception:
                 pass
     finally:
+        if tmp_part_file.exists():
+            try:
+                tmp_part_file.unlink()
+            except OSError:
+                pass
         ACTIVE_R2_TASKS.pop(track_id, None)
 
 
