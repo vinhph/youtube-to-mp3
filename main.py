@@ -275,20 +275,27 @@ async def _upload_part_to_r2(
     part_number: int,
     part_bytes: bytes,
 ) -> str:
-    for attempt in range(3):
-        url, hdrs = sign_r2_request(
-            "PUT",
-            r2_key,
-            {"partNumber": str(part_number), "uploadId": upload_id},
-            part_bytes,
-        )
-        resp = await client.put(url, content=part_bytes, headers=hdrs, timeout=120.0)
-        if resp.status_code == 200:
-            etag = resp.headers.get("ETag") or resp.headers.get("etag")
-            if etag:
-                return etag
+    for attempt in range(4):
+        try:
+            url, hdrs = await asyncio.to_thread(
+                sign_r2_request,
+                "PUT",
+                r2_key,
+                {"partNumber": str(part_number), "uploadId": upload_id},
+                part_bytes,
+            )
+            resp = await asyncio.wait_for(
+                client.put(url, content=part_bytes, headers=hdrs),
+                timeout=45.0,
+            )
+            if resp.status_code == 200:
+                etag = resp.headers.get("ETag") or resp.headers.get("etag")
+                if etag:
+                    return etag
+        except Exception as exc:
+            print(f"[R2] Part {part_number} upload attempt {attempt + 1} error: {exc}")
         await asyncio.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(f"Failed to upload part {part_number} to R2 (HTTP {resp.status_code})")
+    raise RuntimeError(f"Failed to upload part {part_number} to R2 after 4 attempts")
 
 
 async def background_upload_to_r2(
@@ -366,23 +373,24 @@ async def background_upload_to_r2(
                     end_byte = min(offset + PART_SIZE - 1, total_size - 1)
                     expected_chunk_len = end_byte - offset + 1
 
-                    # Fetch this 8 MB range with up to 4 retries
+                    # Fetch this 8 MB range with strict 30s timeout and up to 5 retries
                     part_bytes = b""
-                    for attempt in range(4):
+                    for attempt in range(5):
                         try:
                             range_headers = {**base_headers, "Range": f"bytes={offset}-{end_byte}"}
-                            chunk_resp = await stream_client.get(resolved_url, headers=range_headers)
-                            if chunk_resp.status_code in (200, 206) and len(chunk_resp.content) == expected_chunk_len:
-                                part_bytes = chunk_resp.content
-                                break
-                            # If redirect URL expired mid-download, re-resolve from source_stream_url
-                            chunk_resp = await stream_client.get(source_stream_url, headers=range_headers)
-                            resolved_url = str(chunk_resp.url)
+                            target_url = resolved_url if attempt == 0 else source_stream_url
+                            chunk_resp = await asyncio.wait_for(
+                                stream_client.get(target_url, headers=range_headers),
+                                timeout=30.0,
+                            )
+                            if target_url == source_stream_url and chunk_resp.status_code in (200, 206):
+                                resolved_url = str(chunk_resp.url)
                             if chunk_resp.status_code in (200, 206) and len(chunk_resp.content) == expected_chunk_len:
                                 part_bytes = chunk_resp.content
                                 break
                         except Exception as chunk_err:
-                            if attempt == 3:
+                            print(f"[R2] Range {offset}-{end_byte} attempt {attempt + 1} stalled/failed: {chunk_err}")
+                            if attempt == 4:
                                 raise RuntimeError(f"Range {offset}-{end_byte} failed: {chunk_err}")
                         await asyncio.sleep(1.5 * (attempt + 1))
 
@@ -396,6 +404,7 @@ async def background_upload_to_r2(
 
                     pct = min(99, round((offset / total_size) * 100))
                     update_track_fields(track_id, r2_status="uploading", r2_progress=pct)
+                    await asyncio.sleep(0.05)
 
                 total_uploaded = offset
 
