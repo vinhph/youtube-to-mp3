@@ -278,7 +278,7 @@ async def query_ytstream_audio(video_id: str) -> dict:
                         f for f in adaptive
                         if "audio" in (f.get("mimeType") or "") and f.get("url")
                     ]
-                    # Sort candidates
+                    # Sort candidates: prefer lightweight audio streams first, then combined video+audio (itag 18)
                     candidates = []
                     for itag in (249, 250, 140, 251):
                         matched = next((f for f in audio_formats if f.get("itag") == itag), None)
@@ -288,11 +288,17 @@ async def query_ytstream_audio(video_id: str) -> dict:
                         if f not in candidates:
                             candidates.append(f)
 
+                    # Add combined formats (e.g. itag 18: 360p mp4) as reliable fallback when adaptive streams are throttled
+                    combined = data.get("formats") or []
+                    for f in combined:
+                        if f.get("url") and f not in candidates:
+                            candidates.append(f)
+
                     # Find first candidate whose URL is actually accessible
                     for chosen in candidates:
                         if await is_stream_url_accessible(chosen["url"], socks_proxy):
                             mime_raw = (chosen.get("mimeType") or "audio/webm").split(";")[0].strip()
-                            ext = "m4a" if "mp4" in mime_raw else "webm"
+                            ext = "mp4" if ("mp4" in mime_raw or chosen.get("itag") in (18, 22, 140)) else "webm"
                             thumbs = data.get("thumbnail") or []
                             thumb_url = (
                                 thumbs[-1].get("url")
