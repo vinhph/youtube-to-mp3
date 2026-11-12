@@ -386,16 +386,16 @@ async def _fetch_chunk_file(
     dest_file: Path,
     user_agent: str,
     socks_proxy: str,
-) -> bool:
-    """Downloads a byte range to dest_file via curl with proxy fallback to direct."""
+) -> tuple[bool, str]:
+    """Downloads a byte range to dest_file via curl trying both proxy and direct."""
     if dest_file.exists():
         try:
             dest_file.unlink()
         except OSError:
             pass
 
-    is_direct_host = "123tokyo.xyz" in stream_url
-    proxy_candidates = [None] if is_direct_host else [socks_proxy, None]
+    proxy_candidates = [socks_proxy, None]
+    last_err_msg = ""
 
     for p_candidate in proxy_candidates:
         cmd = [
@@ -423,19 +423,21 @@ async def _fetch_chunk_file(
             err_msg = stderr_data.decode("utf-8", errors="replace").strip()
 
             if proc.returncode == 0 and dest_file.exists() and dest_file.stat().st_size == expected_chunk_len:
-                return True
+                return True, ""
             else:
                 sz = dest_file.stat().st_size if dest_file.exists() else 0
-                print(f"[R2] curl chunk {offset}-{end_byte} (proxy={bool(p_candidate)}) code={proc.returncode}, size={sz}/{expected_chunk_len}, err={err_msg}")
+                last_err_msg = f"proxy={bool(p_candidate)} exit={proc.returncode} sz={sz}/{expected_chunk_len} err={err_msg}"
+                print(f"[R2] curl chunk {offset}-{end_byte} {last_err_msg}")
                 if dest_file.exists():
                     try:
                         dest_file.unlink()
                     except OSError:
                         pass
         except Exception as curl_err:
-            print(f"[R2] curl chunk error (proxy={bool(p_candidate)}): {curl_err}")
+            last_err_msg = f"proxy={bool(p_candidate)} exc={curl_err}"
+            print(f"[R2] curl chunk error: {last_err_msg}")
 
-    return False
+    return False, last_err_msg
 
 
 async def background_upload_to_r2(
@@ -540,6 +542,7 @@ async def background_upload_to_r2(
                 expected_chunk_len = end_byte - offset + 1
 
                 downloaded_ok = False
+                last_err = ""
                 for attempt in range(6):
                     # On attempt 3, attempt to refresh stream URL in case of 403 or signature expiration
                     if attempt == 2:
@@ -551,7 +554,7 @@ async def background_upload_to_r2(
                         except Exception as ref_exc:
                             print(f"[R2] Failed to refresh stream link: {ref_exc}")
 
-                    downloaded_ok = await _fetch_chunk_file(
+                    downloaded_ok, last_err = await _fetch_chunk_file(
                         stream_url=source_stream_url,
                         offset=offset,
                         end_byte=end_byte,
@@ -566,7 +569,7 @@ async def background_upload_to_r2(
                     await asyncio.sleep(2.0 * (attempt + 1))
 
                 if not downloaded_ok:
-                    raise RuntimeError(f"Failed to fetch byte range {offset}-{end_byte}")
+                    raise RuntimeError(f"Failed byte range {offset}-{end_byte} ({last_err})")
 
                 etag = await _upload_part_file_to_r2(r2_key, upload_id, part_number, tmp_part_file)
                 parts_etags.append((part_number, etag))
@@ -896,6 +899,59 @@ async def delete_track(track_id: str):
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/api/debug")
+async def debug_diagnostics():
+    """Diagnostic endpoint to inspect server network connectivity and proxy state."""
+    results = {}
+
+    # Test 1: WARP proxy
+    try:
+        proc1 = await asyncio.create_subprocess_exec(
+            "curl", "-s", "-I", "--proxy", "socks5h://127.0.0.1:40000", "--max-time", "5", "https://cloudflare.com/cdn-cgi/trace",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out1, err1 = await asyncio.wait_for(proc1.communicate(), timeout=7.0)
+        results["warp_proxy_40000"] = {
+            "exit": proc1.returncode,
+            "out": out1.decode(errors="replace").splitlines()[:3],
+            "err": err1.decode(errors="replace").strip()
+        }
+    except Exception as e:
+        results["warp_proxy_40000"] = {"error": str(e)}
+
+    # Test 2: Direct connection to 123tokyo.xyz
+    try:
+        proc2 = await asyncio.create_subprocess_exec(
+            "curl", "-s", "-I", "--max-time", "5", "-A", "Mozilla/5.0", "https://nu.123tokyo.xyz/",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out2, err2 = await asyncio.wait_for(proc2.communicate(), timeout=7.0)
+        results["direct_123tokyo"] = {
+            "exit": proc2.returncode,
+            "out": out2.decode(errors="replace").splitlines()[:3],
+            "err": err2.decode(errors="replace").strip()
+        }
+    except Exception as e:
+        results["direct_123tokyo"] = {"error": str(e)}
+
+    # Test 3: 123tokyo.xyz through WARP proxy
+    try:
+        proc3 = await asyncio.create_subprocess_exec(
+            "curl", "-s", "-I", "--proxy", "socks5h://127.0.0.1:40000", "--max-time", "5", "-A", "Mozilla/5.0", "https://nu.123tokyo.xyz/",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out3, err3 = await asyncio.wait_for(proc3.communicate(), timeout=7.0)
+        results["warp_123tokyo"] = {
+            "exit": proc3.returncode,
+            "out": out3.decode(errors="replace").splitlines()[:3],
+            "err": err3.decode(errors="replace").strip()
+        }
+    except Exception as e:
+        results["warp_123tokyo"] = {"error": str(e)}
+
+    return results
 
 
 if __name__ == "__main__":
