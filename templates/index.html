@@ -490,6 +490,28 @@
                 actions.appendChild(playBtn);
                 actions.appendChild(restartBtn);
                 actions.appendChild(dlLink);
+                if (track.r2_status === 'failed') {
+                    const retryBtn = document.createElement('button');
+                    retryBtn.className = 'icon-btn';
+                    retryBtn.textContent = 'Retry R2';
+                    retryBtn.title = 'Retry uploading to Cloudflare R2';
+                    retryBtn.onclick = async (e) => {
+                        e.stopPropagation();
+                        retryBtn.textContent = 'Retrying...';
+                        try {
+                            const res = await fetch(`/api/retry/${track.id}`, { method: 'POST' });
+                            const d = await res.json();
+                            if (d.status === 'ok') {
+                                track.r2_status = 'uploading';
+                                track.r2_progress = 0;
+                                renderPlaylist();
+                            }
+                        } catch (err) {
+                            alert('Retry failed: ' + err.message);
+                        }
+                    };
+                    actions.appendChild(retryBtn);
+                }
                 actions.appendChild(delBtn);
 
                 li.appendChild(main);

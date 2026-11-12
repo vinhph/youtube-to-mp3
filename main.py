@@ -330,6 +330,66 @@ async def _upload_part_file_to_r2(
     raise RuntimeError(f"Failed to upload part {part_number} to R2 after 4 attempts")
 
 
+async def _fetch_chunk_file(
+    stream_url: str,
+    offset: int,
+    end_byte: int,
+    expected_chunk_len: int,
+    dest_file: Path,
+    user_agent: str,
+    socks_proxy: str,
+) -> bool:
+    """Downloads a byte range to dest_file via curl with proxy fallback to direct."""
+    if dest_file.exists():
+        try:
+            dest_file.unlink()
+        except OSError:
+            pass
+
+    is_direct_host = "123tokyo.xyz" in stream_url
+    proxy_candidates = [None] if is_direct_host else [socks_proxy, None]
+
+    for p_candidate in proxy_candidates:
+        cmd = [
+            "curl",
+            "-s",
+            "-L",
+            "--max-time",
+            "45",
+            "-r",
+            f"{offset}-{end_byte}",
+            "-A",
+            user_agent,
+        ]
+        if p_candidate:
+            cmd.extend(["--proxy", p_candidate])
+        cmd.extend(["-o", str(dest_file), stream_url])
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=50.0)
+            err_msg = stderr_data.decode("utf-8", errors="replace").strip()
+
+            if proc.returncode == 0 and dest_file.exists() and dest_file.stat().st_size == expected_chunk_len:
+                return True
+            else:
+                sz = dest_file.stat().st_size if dest_file.exists() else 0
+                print(f"[R2] curl chunk {offset}-{end_byte} (proxy={bool(p_candidate)}) code={proc.returncode}, size={sz}/{expected_chunk_len}, err={err_msg}")
+                if dest_file.exists():
+                    try:
+                        dest_file.unlink()
+                    except OSError:
+                        pass
+        except Exception as curl_err:
+            print(f"[R2] curl chunk error (proxy={bool(p_candidate)}): {curl_err}")
+
+    return False
+
+
 async def background_upload_to_r2(
     track_id: str,
     video_id: str,
@@ -341,13 +401,14 @@ async def background_upload_to_r2(
     """
     Streams audio from YouTube CDN in 5 MB chunks via a temporary 5 MB file in /tmp
     using native curl processes -> < 1 MB Python RAM used (prevents OOM kills on low-RAM VPS!).
+    Automatically retries with refreshed stream URLs if links expire or return 403.
     """
     PART_SIZE = 5 * 1024 * 1024  # 5 MB (exact S3 minimum part size, minimal temp footprint)
     upload_id: Optional[str] = None
     tmp_part_file = Path(f"/tmp/r2_part_{track_id}.tmp")
 
     try:
-        update_track_fields(track_id, r2_status="uploading", r2_progress=0)
+        update_track_fields(track_id, r2_status="uploading", r2_progress=0, r2_error=None)
 
         timeout_cfg = httpx.Timeout(connect=30.0, read=60.0, write=60.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout_cfg, follow_redirects=True) as client:
@@ -374,21 +435,41 @@ async def background_upload_to_r2(
             )
             socks_proxy = WARP_PROXY.replace("socks5://", "socks5h://")
 
-            # Probe total size using curl
+            # Probe total size using curl if not known
             total_size = expected_size
             if not total_size:
-                probe_proc = await asyncio.create_subprocess_exec(
-                    "curl", "-s", "-L", "-I", "--proxy", socks_proxy, "--max-time", "20",
-                    "-r", "0-0", "-A", user_agent, source_stream_url,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                )
-                p_out, _ = await probe_proc.communicate()
-                for line in p_out.decode("utf-8", errors="replace").splitlines():
-                    if line.lower().startswith("content-range:") and "/" in line:
-                        try:
-                            total_size = int(line.split("/")[-1].strip())
-                        except ValueError:
-                            pass
+                for probe_proxy in [socks_proxy, None]:
+                    probe_cmd = ["curl", "-s", "-L", "-I", "--max-time", "20", "-r", "0-0", "-A", user_agent]
+                    if probe_proxy and "123tokyo.xyz" not in source_stream_url:
+                        probe_cmd.extend(["--proxy", probe_proxy])
+                    probe_cmd.append(source_stream_url)
+
+                    probe_proc = await asyncio.create_subprocess_exec(
+                        *probe_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    p_out, _ = await probe_proc.communicate()
+                    for line in p_out.decode("utf-8", errors="replace").splitlines():
+                        if line.lower().startswith("content-range:") and "/" in line:
+                            try:
+                                total_size = int(line.split("/")[-1].strip())
+                                break
+                            except ValueError:
+                                pass
+                    if total_size:
+                        break
+
+            if not total_size:
+                # Try refreshing stream URL once in case original was dead
+                try:
+                    fresh = await query_ytstream_audio(video_id)
+                    source_stream_url = fresh["link"]
+                    total_size = fresh.get("content_length", 0)
+                    update_track_fields(track_id, audio_url=source_stream_url)
+                except Exception:
+                    pass
+
             if not total_size:
                 raise RuntimeError("Could not determine total audio stream byte length")
 
@@ -397,36 +478,30 @@ async def background_upload_to_r2(
                 end_byte = min(offset + PART_SIZE - 1, total_size - 1)
                 expected_chunk_len = end_byte - offset + 1
 
-                # Download 5 MB range directly to /tmp/r2_part_<id>.tmp (0 MB in Python RAM!)
                 downloaded_ok = False
-                for attempt in range(5):
-                    try:
-                        if tmp_part_file.exists():
-                            tmp_part_file.unlink()
-                        proc = await asyncio.create_subprocess_exec(
-                            "curl",
-                            "-s",
-                            "-L",
-                            "--proxy",
-                            socks_proxy,
-                            "--max-time",
-                            "45",
-                            "-r",
-                            f"{offset}-{end_byte}",
-                            "-A",
-                            user_agent,
-                            "-o",
-                            str(tmp_part_file),
-                            source_stream_url,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        await asyncio.wait_for(proc.communicate(), timeout=50.0)
-                        if proc.returncode == 0 and tmp_part_file.exists() and tmp_part_file.stat().st_size == expected_chunk_len:
-                            downloaded_ok = True
-                            break
-                    except Exception as chunk_err:
-                        print(f"[R2] Range {offset}-{end_byte} attempt {attempt + 1} error: {repr(chunk_err)}")
+                for attempt in range(6):
+                    # On attempt 3, attempt to refresh stream URL in case of 403 or signature expiration
+                    if attempt == 2:
+                        try:
+                            print(f"[R2] Refreshing stream URL for {video_id} on chunk attempt {attempt + 1}...")
+                            fresh = await query_ytstream_audio(video_id)
+                            source_stream_url = fresh["link"]
+                            update_track_fields(track_id, audio_url=source_stream_url)
+                        except Exception as ref_exc:
+                            print(f"[R2] Failed to refresh stream link: {ref_exc}")
+
+                    downloaded_ok = await _fetch_chunk_file(
+                        stream_url=source_stream_url,
+                        offset=offset,
+                        end_byte=end_byte,
+                        expected_chunk_len=expected_chunk_len,
+                        dest_file=tmp_part_file,
+                        user_agent=user_agent,
+                        socks_proxy=socks_proxy,
+                    )
+                    if downloaded_ok:
+                        break
+
                     await asyncio.sleep(2.0 * (attempt + 1))
 
                 if not downloaded_ok:
@@ -528,10 +603,25 @@ async def retry_pending_r2_backups_on_startup():
     """Automatically retry/resume R2 backup for any track in playlist that hasn't finished backing up."""
     items = load_playlist()
     for track in items:
-        if track.get("r2_status") != "ready" and track.get("audio_url"):
-            ext = track.get("ext") or "webm"
-            mime = "audio/mp4" if ext == "m4a" else ("audio/mpeg" if ext == "mp3" else "audio/webm")
-            trigger_r2_backup_if_needed(track, track["audio_url"], mime)
+        if track.get("r2_status") != "ready":
+            video_id = track.get("youtube_id")
+            if video_id:
+                try:
+                    fresh = await query_ytstream_audio(video_id)
+                    ext = fresh.get("ext") or track.get("ext") or "webm"
+                    mime = fresh.get("mime_type") or "audio/webm"
+                    clen = fresh.get("content_length") or 0
+                    track["audio_url"] = fresh["link"]
+                    save_playlist(items)
+                    trigger_r2_backup_if_needed(track, fresh["link"], mime, clen)
+                    continue
+                except Exception as e:
+                    print(f"[Startup] Could not refresh URL for {video_id}: {e}")
+
+            if track.get("audio_url"):
+                ext = track.get("ext") or "webm"
+                mime = "audio/mp4" if ext == "m4a" else ("audio/mpeg" if ext == "mp3" else "audio/webm")
+                trigger_r2_backup_if_needed(track, track["audio_url"], mime)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -579,12 +669,20 @@ async def convert_video(payload: ConvertRequest):
     content_length = data.get("content_length", 0)
 
     if existing:
-        existing["audio_url"] = existing.get("r2_url") or direct_link
+        if existing.get("r2_status") == "ready" and existing.get("r2_url"):
+            existing["audio_url"] = existing["r2_url"]
+            save_playlist(items)
+            return {"status": "ok", "track": existing, "tracks": items}
+
+        existing["audio_url"] = direct_link
         existing["title"] = title
         existing["duration"] = duration
         existing["uploader"] = uploader
         existing["thumbnail"] = thumbnail
         existing["ext"] = ext
+        existing["r2_status"] = "uploading"
+        existing["r2_progress"] = 0
+        existing["r2_error"] = None
         save_playlist(items)
         trigger_r2_backup_if_needed(existing, direct_link, mime_type, content_length)
         return {"status": "ok", "track": existing, "tracks": items}
@@ -615,6 +713,38 @@ async def convert_video(payload: ConvertRequest):
     trigger_r2_backup_if_needed(track, direct_link, mime_type, content_length)
 
     return {"status": "ok", "track": track, "tracks": items}
+
+
+@app.post("/api/retry/{track_id}")
+async def retry_track_backup(track_id: str):
+    items = load_playlist()
+    track: Optional[dict] = next((t for t in items if t["id"] == track_id), None)
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    if track.get("r2_status") == "ready" and track.get("r2_url"):
+        return {"status": "ok", "message": "Already backed up to R2", "track": track}
+
+    video_id = track.get("youtube_id")
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Missing YouTube video ID")
+
+    try:
+        data = await query_ytstream_audio(video_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch audio stream: {exc}")
+
+    direct_link = data["link"]
+    track["audio_url"] = direct_link
+    track["r2_status"] = "uploading"
+    track["r2_progress"] = 0
+    track["r2_error"] = None
+    save_playlist(items)
+
+    mime_type = data.get("mime_type", "audio/webm")
+    content_length = data.get("content_length", 0)
+    trigger_r2_backup_if_needed(track, direct_link, mime_type, content_length)
+    return {"status": "ok", "track": track}
 
 
 @app.post("/api/progress/{track_id}")
