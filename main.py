@@ -188,7 +188,7 @@ def update_track_fields(track_id: str, **fields) -> Optional[dict]:
 
 
 async def is_stream_url_accessible(url: str, socks_proxy: Optional[str] = None) -> bool:
-    """Checks if a stream URL allows downloading byte ranges without returning 403 Forbidden."""
+    """Checks if a stream URL allows downloading 5MB byte ranges without returning 403 Forbidden."""
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -198,7 +198,7 @@ async def is_stream_url_accessible(url: str, socks_proxy: Optional[str] = None) 
     candidates = [None] if is_direct_host else [socks_proxy, None]
 
     for p in candidates:
-        cmd = ["curl", "-s", "-I", "-L", "--max-time", "6", "-r", "0-500000", "-A", user_agent]
+        cmd = ["curl", "-s", "-I", "-L", "--max-time", "8", "-r", "0-5242879", "-A", user_agent]
         if p:
             cmd.extend(["--proxy", p])
         cmd.append(url)
@@ -208,13 +208,14 @@ async def is_stream_url_accessible(url: str, socks_proxy: Optional[str] = None) 
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=8.0)
+            out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
             out = out_bytes.decode("utf-8", errors="replace")
-            for line in out.splitlines():
-                if line.startswith("HTTP/"):
-                    parts = line.split()
-                    if len(parts) > 1 and parts[1] in ("200", "206"):
-                        return True
+            http_lines = [l for l in out.splitlines() if l.startswith("HTTP/")]
+            if http_lines:
+                last_line = http_lines[-1]
+                parts = last_line.split()
+                if len(parts) > 1 and parts[1] in ("200", "206"):
+                    return True
         except Exception:
             pass
     return False
