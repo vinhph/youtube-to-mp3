@@ -395,7 +395,7 @@ async def _fetch_chunk_file(
             pass
 
     proxy_candidates = [socks_proxy, None]
-    last_err_msg = ""
+    attempt_errs = []
 
     for p_candidate in proxy_candidates:
         cmd = [
@@ -426,18 +426,25 @@ async def _fetch_chunk_file(
                 return True, ""
             else:
                 sz = dest_file.stat().st_size if dest_file.exists() else 0
-                last_err_msg = f"proxy={bool(p_candidate)} exit={proc.returncode} sz={sz}/{expected_chunk_len} err={err_msg}"
-                print(f"[R2] curl chunk {offset}-{end_byte} {last_err_msg}")
+                sample = ""
+                if dest_file.exists() and sz < 200:
+                    try:
+                        sample = dest_file.read_text(errors="replace").strip()
+                    except Exception:
+                        pass
+                err_detail = f"proxy={bool(p_candidate)} exit={proc.returncode} sz={sz}/{expected_chunk_len} sample='{sample}' err='{err_msg}'"
+                attempt_errs.append(err_detail)
+                print(f"[R2] curl chunk {offset}-{end_byte} {err_detail}")
                 if dest_file.exists():
                     try:
                         dest_file.unlink()
                     except OSError:
                         pass
         except Exception as curl_err:
-            last_err_msg = f"proxy={bool(p_candidate)} exc={curl_err}"
-            print(f"[R2] curl chunk error: {last_err_msg}")
+            attempt_errs.append(f"proxy={bool(p_candidate)} exc={curl_err}")
+            print(f"[R2] curl chunk error: {curl_err}")
 
-    return False, last_err_msg
+    return False, "; ".join(attempt_errs)
 
 
 async def background_upload_to_r2(
@@ -950,6 +957,40 @@ async def debug_diagnostics():
         }
     except Exception as e:
         results["warp_123tokyo"] = {"error": str(e)}
+
+    # Test 4: Download 100 bytes of track audio_url via WARP
+    items = load_playlist()
+    track_url = items[0].get("audio_url") if items else ""
+    if track_url:
+        try:
+            proc4 = await asyncio.create_subprocess_exec(
+                "curl", "-s", "-i", "--proxy", "socks5h://127.0.0.1:40000", "--max-time", "8",
+                "-r", "0-100", "-A", "Mozilla/5.0", track_url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out4, err4 = await asyncio.wait_for(proc4.communicate(), timeout=10.0)
+            results["warp_track_url_100b"] = {
+                "exit": proc4.returncode,
+                "out": out4.decode(errors="replace")[:400],
+                "err": err4.decode(errors="replace").strip()
+            }
+        except Exception as e:
+            results["warp_track_url_100b"] = {"error": str(e)}
+
+        try:
+            proc5 = await asyncio.create_subprocess_exec(
+                "curl", "-s", "-i", "--max-time", "8",
+                "-r", "0-100", "-A", "Mozilla/5.0", track_url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out5, err5 = await asyncio.wait_for(proc5.communicate(), timeout=10.0)
+            results["direct_track_url_100b"] = {
+                "exit": proc5.returncode,
+                "out": out5.decode(errors="replace")[:400],
+                "err": err5.decode(errors="replace").strip()
+            }
+        except Exception as e:
+            results["direct_track_url_100b"] = {"error": str(e)}
 
     return results
 
