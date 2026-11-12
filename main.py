@@ -187,62 +187,47 @@ def update_track_fields(track_id: str, **fields) -> Optional[dict]:
     return track
 
 
-async def query_ytstream_audio(video_id: str) -> dict:
-    """
-    Uses YTStream (ytstream-download-youtube-videos.p.rapidapi.com) to extract direct
-    audio stream. Prefers smallest audio stream (itag 249 -> 250 -> 140 -> 251) as default.
-    """
-    headers = {
-        "x-rapidapi-host": YTSTREAM_HOST,
+async def is_stream_url_accessible(url: str, socks_proxy: Optional[str] = None) -> bool:
+    """Checks if a stream URL allows downloading byte ranges without returning 403 Forbidden."""
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    )
+    is_direct_host = "123tokyo.xyz" in url
+    candidates = [None] if is_direct_host else [socks_proxy, None]
+
+    for p in candidates:
+        cmd = ["curl", "-s", "-I", "-L", "--max-time", "6", "-r", "0-500000", "-A", user_agent]
+        if p:
+            cmd.extend(["--proxy", p])
+        cmd.append(url)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=8.0)
+            out = out_bytes.decode("utf-8", errors="replace")
+            for line in out.splitlines():
+                if line.startswith("HTTP/"):
+                    parts = line.split()
+                    if len(parts) > 1 and parts[1] in ("200", "206"):
+                        return True
+        except Exception:
+            pass
+    return False
+
+
+async def query_rapidapi_mp3(video_id: str) -> dict:
+    """Fetches a high-quality MP3 from youtube-mp36."""
+    mp3_headers = {
+        "x-rapidapi-host": MP3_HOST,
         "x-rapidapi-key": RAPIDAPI_KEY,
     }
-    api_url = f"https://{YTSTREAM_HOST}/dl"
-
+    mp3_url = f"https://{MP3_HOST}/dl"
     async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-        resp = await client.get(api_url, params={"id": video_id}, headers=headers)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("status") == "OK":
-                adaptive = data.get("adaptiveFormats") or []
-                audio_formats = [
-                    f for f in adaptive
-                    if "audio" in (f.get("mimeType") or "") and f.get("url")
-                ]
-                # Sort by contentLength / bitrate ascending so smallest size is chosen first
-                # (itag 249 ~50kbps opus is ~1.2GB for 60h vs 3.36GB for itag 140)
-                chosen = (
-                    next((f for f in audio_formats if f.get("itag") == 249), None)
-                    or next((f for f in audio_formats if f.get("itag") == 250), None)
-                    or next((f for f in audio_formats if f.get("itag") == 140), None)
-                    or next((f for f in audio_formats if f.get("itag") == 251), None)
-                    or (audio_formats[0] if audio_formats else None)
-                )
-                if chosen:
-                    mime_raw = (chosen.get("mimeType") or "audio/webm").split(";")[0].strip()
-                    ext = "m4a" if "mp4" in mime_raw else "webm"
-                    thumbs = data.get("thumbnail") or []
-                    thumb_url = (
-                        thumbs[-1].get("url")
-                        if isinstance(thumbs, list) and thumbs
-                        else f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-                    )
-                    return {
-                        "link": chosen["url"],
-                        "mime_type": mime_raw,
-                        "ext": ext,
-                        "content_length": int(chosen.get("contentLength") or 0),
-                        "title": data.get("title") or f"YouTube ({video_id})",
-                        "duration": round(float(data.get("lengthSeconds") or 0)),
-                        "channelTitle": data.get("channelTitle") or "YouTube",
-                        "thumbnail": thumb_url,
-                    }
-
-        # Fallback to youtube-mp36 if YTStream did not return a stream
-        mp3_headers = {
-            "x-rapidapi-host": MP3_HOST,
-            "x-rapidapi-key": RAPIDAPI_KEY,
-        }
-        mp3_url = f"https://{MP3_HOST}/dl"
         for _ in range(30):
             r2 = await client.get(mp3_url, params={"id": video_id}, headers=mp3_headers)
             if r2.status_code != 200:
@@ -265,8 +250,70 @@ async def query_ytstream_audio(video_id: str) -> dict:
             else:
                 msg = d2.get("msg") or d2.get("message") or str(d2)
                 raise RuntimeError(f"RapidAPI error: {msg}")
+    raise RuntimeError("Timed out waiting for MP3 extraction.")
 
-        raise RuntimeError("Timed out waiting for audio stream extraction.")
+
+async def query_ytstream_audio(video_id: str) -> dict:
+    """
+    Uses YTStream (ytstream-download-youtube-videos.p.rapidapi.com) to extract direct
+    audio stream. Prefers smallest audio stream (itag 249 -> 250 -> 140 -> 251) as default.
+    Automatically tests stream accessibility and falls back to youtube-mp36 if YouTube returns 403.
+    """
+    headers = {
+        "x-rapidapi-host": YTSTREAM_HOST,
+        "x-rapidapi-key": RAPIDAPI_KEY,
+    }
+    api_url = f"https://{YTSTREAM_HOST}/dl"
+    socks_proxy = WARP_PROXY.replace("socks5://", "socks5h://")
+
+    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+        try:
+            resp = await client.get(api_url, params={"id": video_id}, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "OK":
+                    adaptive = data.get("adaptiveFormats") or []
+                    audio_formats = [
+                        f for f in adaptive
+                        if "audio" in (f.get("mimeType") or "") and f.get("url")
+                    ]
+                    # Sort candidates
+                    candidates = []
+                    for itag in (249, 250, 140, 251):
+                        matched = next((f for f in audio_formats if f.get("itag") == itag), None)
+                        if matched:
+                            candidates.append(matched)
+                    for f in audio_formats:
+                        if f not in candidates:
+                            candidates.append(f)
+
+                    # Find first candidate whose URL is actually accessible
+                    for chosen in candidates:
+                        if await is_stream_url_accessible(chosen["url"], socks_proxy):
+                            mime_raw = (chosen.get("mimeType") or "audio/webm").split(";")[0].strip()
+                            ext = "m4a" if "mp4" in mime_raw else "webm"
+                            thumbs = data.get("thumbnail") or []
+                            thumb_url = (
+                                thumbs[-1].get("url")
+                                if isinstance(thumbs, list) and thumbs
+                                else f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+                            )
+                            return {
+                                "link": chosen["url"],
+                                "mime_type": mime_raw,
+                                "ext": ext,
+                                "content_length": int(chosen.get("contentLength") or 0),
+                                "title": data.get("title") or f"YouTube ({video_id})",
+                                "duration": round(float(data.get("lengthSeconds") or 0)),
+                                "channelTitle": data.get("channelTitle") or "YouTube",
+                                "thumbnail": thumb_url,
+                            }
+                    print(f"[Stream] All direct YTStream formats for {video_id} returned 403, falling back to MP3...")
+        except Exception as yt_err:
+            print(f"[Stream] YTStream query error for {video_id}: {yt_err}")
+
+    # Fallback to youtube-mp36
+    return await query_rapidapi_mp3(video_id)
 
 
 def _sha256_file(path: Path) -> str:
@@ -409,6 +456,19 @@ async def background_upload_to_r2(
 
     try:
         update_track_fields(track_id, r2_status="uploading", r2_progress=0, r2_error=None)
+
+        socks_proxy = WARP_PROXY.replace("socks5://", "socks5h://")
+
+        # Verify source_stream_url before initiating multipart upload
+        if not await is_stream_url_accessible(source_stream_url, socks_proxy):
+            print(f"[R2] Initial stream URL for {video_id} is inaccessible. Refreshing...")
+            fresh = await query_ytstream_audio(video_id)
+            source_stream_url = fresh["link"]
+            mime_type = fresh.get("mime_type") or mime_type
+            ext = fresh.get("ext") or "webm"
+            r2_key = f"{video_id}_{track_id}.{ext}"
+            expected_size = fresh.get("content_length", 0)
+            update_track_fields(track_id, audio_url=source_stream_url, r2_key=r2_key, ext=ext)
 
         timeout_cfg = httpx.Timeout(connect=30.0, read=60.0, write=60.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout_cfg, follow_redirects=True) as client:
